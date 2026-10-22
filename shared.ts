@@ -16,13 +16,17 @@ import { dirname, join } from "node:path";
 export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
 
 export interface RunMetadata {
-	version: 1;
+	version: 2;
 	handle: string;
 	name?: string;
 	parentSessionId?: string;
 	parentSessionFile?: string;
 	childSessionId?: string;
-	tmuxSession: string;
+	/**
+	 * Herdr terminal hosting the child, set on every launch. Unlike pane IDs, terminal IDs survive
+	 * `herdr pane move`, so the current pane and tab are always resolved from it.
+	 */
+	herdrTerminalId?: string;
 	runDir: string;
 	sessionFile: string;
 	cwd: string;
@@ -100,10 +104,10 @@ export function readMetadata(runDir: string): RunMetadata | undefined {
 		if (typeof value !== "object" || value === null) return undefined;
 		const metadata = value as Partial<RunMetadata>;
 		if (
-			metadata.version !== 1 ||
+			metadata.version !== 2 ||
 			typeof metadata.handle !== "string" ||
 			(metadata.name !== undefined && !isValidRunName(metadata.name)) ||
-			typeof metadata.tmuxSession !== "string" ||
+			(metadata.herdrTerminalId !== undefined && typeof metadata.herdrTerminalId !== "string") ||
 			typeof metadata.sessionFile !== "string" ||
 			typeof metadata.runDir !== "string"
 		) {
@@ -129,7 +133,7 @@ export function updateMetadata(runDir: string, patch: Partial<RunMetadata>): Run
 	const next: RunMetadata = {
 		...current,
 		...patch,
-		version: 1,
+		version: 2,
 		handle: current.handle,
 		runDir: current.runDir,
 		updatedAt: new Date().toISOString(),
@@ -151,12 +155,80 @@ export function removeRunDir(runDir: string): void {
 	rmSync(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
-export function tmuxSessionExists(session: string): boolean {
-	return spawnSync("tmux", ["has-session", "-t", session], { stdio: "ignore" }).status === 0;
+export function insideHerdr(): boolean {
+	return process.env.HERDR_ENV === "1" && !!process.env.HERDR_WORKSPACE_ID;
 }
 
-/** Start the child pi process for a run in its tmux session. `initialArgs` are only passed on first spawn. */
-export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
+function herdr(args: string[]): Record<string, unknown> {
+	const result = spawnSync("herdr", args, { encoding: "utf8" });
+	if (result.error) throw new Error(`Could not run herdr: ${result.error.message}`);
+	if (result.status !== 0) {
+		let message = result.stderr.trim();
+		try {
+			message = JSON.parse(message).error.message ?? message;
+		} catch {
+			// Not a JSON error; keep stderr as is.
+		}
+		throw new Error(`herdr ${args.slice(0, 2).join(" ")} failed: ${message || `exit ${result.status}`}`);
+	}
+	// Some commands, such as `pane run`, print nothing on success.
+	return result.stdout.trim() ? JSON.parse(result.stdout).result : {};
+}
+
+export interface RunPane {
+	paneId: string;
+	tabId: string;
+}
+
+/**
+ * Resolve the pane currently hosting a run, or undefined when it is gone. Herdr closes the pane once
+ * the exec'd pi process exits, so a live pane means a live child. Throws when herdr is unreachable,
+ * because "unknown" must not be mistaken for "exited".
+ */
+export function findRunPane(metadata: RunMetadata): RunPane | undefined {
+	if (!metadata.herdrTerminalId) return undefined;
+	const { panes } = herdr(["pane", "list"]) as { panes: { pane_id: string; tab_id: string; terminal_id: string }[] };
+	const pane = panes.find((candidate) => candidate.terminal_id === metadata.herdrTerminalId);
+	return pane && { paneId: pane.pane_id, tabId: pane.tab_id };
+}
+
+export function closeRunPane(paneId: string): void {
+	try {
+		herdr(["pane", "close", paneId]);
+	} catch {
+		// Already gone.
+	}
+}
+
+export function focusRunTab(pane: RunPane): void {
+	herdr(["tab", "focus", pane.tabId]);
+}
+
+export function runTabLabel(metadata: RunMetadata): string {
+	return `sa:${metadata.name ?? metadata.handle}`;
+}
+
+export function renameRunTab(metadata: RunMetadata): void {
+	try {
+		const pane = findRunPane(metadata);
+		if (pane) herdr(["tab", "rename", pane.tabId, runTabLabel(metadata)]);
+	} catch {
+		// The label is cosmetic; the run itself is unaffected.
+	}
+}
+
+function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/**
+ * Start the child pi process for a run in a new tab of the caller's herdr workspace, without taking
+ * focus. `initialArgs` are only passed on first spawn.
+ */
+export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): RunMetadata {
+	const workspaceId = process.env.HERDR_WORKSPACE_ID;
+	if (!insideHerdr() || !workspaceId) throw new Error("Subagents require running inside a herdr pane");
+
 	let launcher = "pi";
 	const testLauncher = join(metadata.cwd, "pi-test.sh");
 	try {
@@ -166,43 +238,63 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 		// Use the installed pi executable.
 	}
 
-	const result = spawnSync(
-		"tmux",
-		[
-			"new-session",
-			"-d",
-			"-s",
-			metadata.tmuxSession,
-			"-x",
-			"120",
-			"-y",
-			"40",
-			"-c",
-			metadata.cwd,
-			"--",
-			"env",
-			`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
-			launcher,
-			"--session",
-			metadata.sessionFile,
-			"--provider",
-			metadata.provider,
-			"--model",
-			metadata.model,
-			"--thinking",
-			metadata.thinking,
-			...(metadata.launchArgs ?? []),
-			...initialArgs,
-		],
-		{ encoding: "utf8" },
-	);
-	if (result.status !== 0) throw new Error(result.stderr.trim() || "Failed to create tmux session");
+	// The pane starts the user's interactive shell (fish, zsh, ...), whose quoting rules differ. Keep
+	// the command in a POSIX script so the only text typed into the shell is a plain exec of its path.
+	const script = join(metadata.runDir, "launch.sh");
+	if (/['\\\n]/.test(script)) throw new Error(`Unsupported characters in run directory: ${metadata.runDir}`);
+	const command = [
+		"env",
+		`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
+		launcher,
+		"--session",
+		metadata.sessionFile,
+		"--provider",
+		metadata.provider,
+		"--model",
+		metadata.model,
+		"--thinking",
+		metadata.thinking,
+		...(metadata.launchArgs ?? []),
+		...initialArgs,
+	];
+	writeFileSync(script, `#!/bin/sh\nexec ${command.map(shellQuote).join(" ")}\n`, { encoding: "utf8", mode: 0o700 });
+
+	const { root_pane: pane } = herdr([
+		"tab",
+		"create",
+		"--workspace",
+		workspaceId,
+		"--cwd",
+		metadata.cwd,
+		"--label",
+		runTabLabel(metadata),
+		"--no-focus",
+	]) as { root_pane: { pane_id: string; terminal_id: string } };
+	// Record the terminal before pi starts so the child's own metadata updates cannot race this write.
+	const launched = updateMetadata(metadata.runDir, { herdrTerminalId: pane.terminal_id }) ?? metadata;
+	try {
+		// `exec` replaces the shell, so herdr closes the pane (and the tab) when pi exits.
+		herdr(["pane", "run", pane.pane_id, `exec '${script}'`]);
+	} catch (error) {
+		closeRunPane(pane.pane_id);
+		throw error;
+	}
+	return launched;
+}
+
+/** Like findRunPane, but treats an unreachable herdr as "still running" for best-effort display. */
+export function runIsAlive(metadata: RunMetadata): boolean {
+	try {
+		return findRunPane(metadata) !== undefined;
+	} catch {
+		return true;
+	}
 }
 
 export function effectiveRunState(metadata: RunMetadata): RunState {
 	if (
 		(metadata.state === "starting" || metadata.state === "busy" || metadata.state === "idle") &&
-		!tmuxSessionExists(metadata.tmuxSession)
+		!runIsAlive(metadata)
 	) {
 		return "exited";
 	}

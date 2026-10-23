@@ -4,22 +4,18 @@ import { fileURLToPath } from "node:url";
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext, keyHint } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 import {
-	closeRunPane,
 	effectiveRunState,
 	findRunPane,
 	focusRunTab,
 	inboxDir,
 	insideHerdr,
-	launchRun,
 	listRuns,
 	readMetadata,
 	removeRunDir,
 	runDisplayName,
 	type InboxMessage,
 	type RunMetadata,
-	type RunPane,
 	updateMetadata,
-	waitForRunShutdown,
 } from "./shared.ts";
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
@@ -133,30 +129,25 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			);
 		};
 
-		pi.on("session_start", (_event, ctx) => {
-			// Relaunch children that were suspended when this session was last quit or switched away from.
-			// Outside herdr they stay suspended until the session is resumed inside it.
-			for (const run of insideHerdr() ? listRuns(ctx.sessionManager.getSessionId()) : []) {
-				if (!run.suspended) continue;
+		// Children are never closed by the parent: they outlive its quit or session switch and only end
+		// when the user closes their tab or runs `subagent stop`. This only discards runs that ended so.
+		const pruneClosedRuns = (parentSessionId: string): void => {
+			if (!insideHerdr()) return;
+			for (const run of listRuns(parentSessionId)) {
+				// No terminal yet means the run is still being spawned.
+				if (!run.herdrTerminalId) continue;
 				try {
 					if (findRunPane(run)) continue;
 				} catch {
-					continue;
+					// Herdr is unreachable: liveness is unknown, so leave the run untouched.
+					return;
 				}
-				if (!existsSync(run.sessionFile)) {
-					removeRunDir(run.runDir);
-					continue;
-				}
-				const starting = updateMetadata(run.runDir, { state: "starting", error: undefined }) ?? run;
-				try {
-					launchRun(starting);
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					updateMetadata(run.runDir, { state: "error", error: message });
-					if (ctx.hasUI) ctx.ui.notify(`Could not resume subagent ${runDisplayName(run)}: ${message}`, "error");
-				}
+				removeRunDir(run.runDir);
 			}
+		};
 
+		pi.on("session_start", (_event, ctx) => {
+			pruneClosedRuns(ctx.sessionManager.getSessionId());
 			if (!ctx.hasUI) return;
 			widgetContext = ctx;
 			refreshWidget();
@@ -164,30 +155,12 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			widgetTimer.unref();
 		});
 
-		pi.on("session_shutdown", async (event, ctx) => {
+		pi.on("session_shutdown", (event, ctx) => {
 			if (widgetTimer) clearInterval(widgetTimer);
 			widgetTimer = undefined;
 			widgetContext = undefined;
 			ctx.ui.setWidget("subagents", undefined);
-			if (event.reason === "reload") return;
-			// Suspend running children: stop the process but keep transcript and metadata so resuming this
-			// session relaunches them. Children that already exited on their own are discarded.
-			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				let pane: RunPane | undefined;
-				try {
-					pane = findRunPane(run);
-				} catch {
-					// Herdr is unreachable: liveness is unknown, so leave the run untouched.
-					continue;
-				}
-				if (!pane) {
-					if (!run.suspended) removeRunDir(run.runDir);
-					continue;
-				}
-				updateMetadata(run.runDir, { suspended: true });
-				closeRunPane(pane.paneId);
-				await waitForRunShutdown(run.runDir);
-			}
+			if (event.reason !== "reload") pruneClosedRuns(ctx.sessionManager.getSessionId());
 		});
 		return;
 	}
@@ -262,7 +235,6 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			childSessionId: ctx.sessionManager.getSessionId(),
 			sessionFile: ctx.sessionManager.getSessionFile() ?? metadata.sessionFile,
 			state: ctx.isIdle() ? "idle" : "busy",
-			suspended: undefined,
 			error: undefined,
 		});
 		syncSessionName();

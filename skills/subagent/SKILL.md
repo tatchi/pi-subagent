@@ -53,7 +53,7 @@ Three additional built-in tools are available but off by default:
 - `--no-prompt-templates` - Disable prompt-template commands. Usually unnecessary, but useful when testing a minimal child environment.
 - `--no-context-files` - Ignore repository instruction files such as `AGENTS.md` and `CLAUDE.md`. Use only when those instructions would bias an independent investigation. Do not use for implementation unless intentionally bypassing repository guidance.
 
-Spawn prints a random handle and the herdr tab label (`sa:<name>`); it does not take focus. Keep the handle for later commands. Subagents persist after their current turn completes: `wait`, completion, and becoming idle do not terminate them. They survive `/reload`. When the spawning Pi session quits or is replaced, they are suspended and relaunched idle with their history when that session is resumed. They are only removed by `subagent stop`.
+Spawn prints a random handle and the herdr tab label (`sa:<name>`); it does not take focus. Keep the handle for later commands. Subagents persist after their current turn completes: `wait`, completion, and becoming idle do not terminate them. They survive `/reload` and keep running when the spawning Pi session quits or is replaced. They end only when the user closes their herdr tab or `subagent stop` is run.
 
 ## Inspect and wait
 
@@ -88,6 +88,6 @@ Names are 1–64 characters and need not be unique. Messages use the subagent ex
 subagent stop <handle>
 ```
 
-Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This closes the child's herdr pane and removes the run transcript and metadata. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
+Never stop a subagent on your own initiative, even after its work is done: the user keeps subagents around and closes them. Run `stop` only when the user explicitly asks. It closes the child's herdr pane and removes the run transcript and metadata.
 
 The interactive `/subagent` command lists active subagents spawned by the current Pi session. Selecting one focuses its herdr tab; switch tabs to return to the parent.

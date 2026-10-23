@@ -33,10 +33,6 @@ export interface RunMetadata {
 	provider: string;
 	model: string;
 	thinking: string;
-	/** Extra pi CLI flags (tools, isolation) reused when the run is relaunched. */
-	launchArgs?: string[];
-	/** Set by the parent when it stops the child on quit or session switch; the child is relaunched on resume. */
-	suspended?: boolean;
 	state: RunState;
 	hasStarted: boolean;
 	createdAt: string;
@@ -223,9 +219,9 @@ function shellQuote(value: string): string {
 
 /**
  * Start the child pi process for a run in a new tab of the caller's herdr workspace, without taking
- * focus. `initialArgs` are only passed on first spawn.
+ * focus. `piArgs` follow the session and model flags.
  */
-export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): RunMetadata {
+export function launchRun(metadata: RunMetadata, piArgs: string[]): RunMetadata {
 	const workspaceId = process.env.HERDR_WORKSPACE_ID;
 	if (!insideHerdr() || !workspaceId) throw new Error("Subagents require running inside a herdr pane");
 
@@ -254,8 +250,7 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): Ru
 		metadata.model,
 		"--thinking",
 		metadata.thinking,
-		...(metadata.launchArgs ?? []),
-		...initialArgs,
+		...piArgs,
 	];
 	writeFileSync(script, `#!/bin/sh\nexec ${command.map(shellQuote).join(" ")}\n`, { encoding: "utf8", mode: 0o700 });
 

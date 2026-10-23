@@ -166,12 +166,6 @@ function spawnSubagent(args: string[]): void {
 	mkdirSync(inboxDir(runDir), { recursive: true, mode: 0o700 });
 	writeFileSync(sessionFile, "", { mode: 0o600 });
 
-	const launchArgs: string[] = [];
-	if (tools) launchArgs.push("--tools", tools);
-	if (noExtensions) launchArgs.push("--no-extensions", "--extension", extensionPath);
-	if (noSkills) launchArgs.push("--no-skills");
-	if (noPromptTemplates) launchArgs.push("--no-prompt-templates");
-	if (noContextFiles) launchArgs.push("--no-context-files");
 
 	const now = new Date().toISOString();
 	const metadata: RunMetadata = {
@@ -186,7 +180,6 @@ function spawnSubagent(args: string[]): void {
 		provider,
 		model,
 		thinking,
-		launchArgs,
 		state: "starting",
 		hasStarted: false,
 		createdAt: now,
@@ -194,10 +187,16 @@ function spawnSubagent(args: string[]): void {
 	};
 	writeMetadata(metadata);
 
-	const initialArgs = files.map((file) => `@${file}`);
-	if (prompts.length > 0) initialArgs.push(`Task:\n${prompts.join("\n\n")}`);
+	const piArgs: string[] = [];
+	if (tools) piArgs.push("--tools", tools);
+	if (noExtensions) piArgs.push("--no-extensions", "--extension", extensionPath);
+	if (noSkills) piArgs.push("--no-skills");
+	if (noPromptTemplates) piArgs.push("--no-prompt-templates");
+	if (noContextFiles) piArgs.push("--no-context-files");
+	piArgs.push(...files.map((file) => `@${file}`));
+	if (prompts.length > 0) piArgs.push(`Task:\n${prompts.join("\n\n")}`);
 	try {
-		launchRun(metadata, initialArgs);
+		launchRun(metadata, piArgs);
 	} catch (error) {
 		removeRunDir(runDir);
 		throw error;

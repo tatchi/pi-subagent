@@ -52,7 +52,12 @@ function resultContent(details: SubagentResultDetails): string {
 		: undefined;
 	const lines = [`<subagent_result ${attributes}>`];
 	if (prompt) lines.push(`<prompt>${xml(prompt)}</prompt>`);
-	lines.push(`<response>${xml(details.response)}</response>`, "</subagent_result>");
+	lines.push(`<response>${xml(details.response)}</response>`);
+	// The parent may not have loaded the subagent skill, so each result carries its own reply path.
+	lines.push(
+		`<reply>Report this to the user. Relay any question or decision to them, then forward their answer by running this shell command with the bash tool: subagent send ${details.handle} "&lt;answer&gt;"</reply>`,
+		"</subagent_result>",
+	);
 	return lines.join("\n");
 }
 

@@ -1,93 +1,47 @@
 ---
 name: subagent
-description: Spawn and communicate with observable Pi subagents for second opinions, independent investigations, and delegated implementation work.
+description: Run Pi subagents in herdr tabs with the `subagent` bash command. Use whenever the user asks for a subagent, and for delegated implementation, independent reviews or second opinions, and parallel investigations.
 ---
 
 # Subagent
 
-Use the `subagent` CLI to delegate work to a separate Pi process with its own context, running in a new tab of the current herdr workspace. Managed subagents cannot spawn nested subagents, and this skill is not loaded into their sessions.
+The `subagent` shell command runs a task in a separate Pi process with its own context, in a new `sa:<name>` tab of the current herdr workspace. Subagents cannot spawn subagents.
 
 ## Spawn
 
-Give each child a short, descriptive name. The name appears in the parent UI, while the generated handle remains its stable identifier:
-
 ```sh
-subagent spawn --name implementation --prompt "Complete task"
+subagent spawn --name review --prompt "Review the current diff independently"
 ```
 
-By default, the child inherits the current Pi provider, model, and reasoning level from the bash environment. Use `--provider`, `--model`, or `--thinking` only when deliberately choosing a different configuration, for example a faster model for simple investigation or a stronger model for difficult review. Never pass `$PI_PROVIDER`, `$PI_MODEL`, or `$PI_REASONING_LEVEL` back to the CLI explicitly.
+- Give each subagent a short, descriptive `--name`; it labels the tab and the status widget. Keep the printed handle: every other command takes it.
+- Repeat `--prompt` and `--file` as needed; the subagent receives all of them in its first turn. `--cwd` defaults to the current directory.
+- The subagent inherits this session's provider, model, and thinking level. Pass `--provider`, `--model`, or `--thinking` only to choose a different configuration deliberately, such as a faster model for a simple lookup or a stronger one for a hard review. Write literal values; never pass `$PI_PROVIDER`, `$PI_MODEL`, or `$PI_REASONING_LEVEL` back.
+- For a read-only investigation or an independent run, choose `--tools` and isolation flags from [spawn-options.md](../../spawn-options.md).
 
-`--cwd` defaults to the current directory. Repeat `--prompt` and `--file` as needed; Pi receives all of them in the first user turn. Run `subagent spawn` directly without piping or redirecting its concise output.
+Run every `subagent` command with the bash tool, unpiped, so its output returns in the tool result. It is unrelated to any `subagent` tool another extension may provide.
 
-## Tools
-
-Without `--tools`, Pi enables its four default tools:
-
-- `read` - Read text files and images.
-- `bash` - Execute shell commands. This can also modify files, so it is not a read-only capability.
-- `edit` - Apply exact text replacements to existing files.
-- `write` - Create or overwrite files.
-
-Three additional built-in tools are available but off by default:
-
-- `grep` - Search file contents.
-- `find` - Find files by glob pattern.
-- `ls` - List directory contents.
-
-`--tools` is a comma-separated allowlist across built-in, extension, and custom tools. Common choices:
+## Wait for the result
 
 ```sh
-# Enforced read-only repository investigation
---tools read,grep,find,ls
-
-# Investigation that may run tests or other commands; bash can modify files
---tools read,bash,grep,find,ls
-
-# Implementation work: omit --tools to use the defaults
-```
-
-## Isolation flags
-
-- `--no-extensions` - Disable normal extension discovery. Use for an independent run that should not inherit unrelated extension behavior or extension-provided tools. The subagent control bridge is still explicitly loaded.
-- `--no-skills` - Hide installed skills from the child. Use for tightly specified tasks that should rely only on the supplied prompt and files.
-- `--no-prompt-templates` - Disable prompt-template commands. Usually unnecessary, but useful when testing a minimal child environment.
-- `--no-context-files` - Ignore repository instruction files such as `AGENTS.md` and `CLAUDE.md`. Use only when those instructions would bias an independent investigation. Do not use for implementation unless intentionally bypassing repository guidance.
-
-Spawn prints a random handle and the herdr tab label (`sa:<name>`); it does not take focus. Keep the handle for later commands. Subagents persist after their current turn completes: `wait`, completion, and becoming idle do not terminate them. They survive `/reload` and keep running when the spawning Pi session quits or is replaced. They end only when the user closes their herdr tab or `subagent stop` is run.
-
-## Inspect and wait
-
-```sh
-subagent status <handle>
-subagent list
 subagent wait <handle>
 ```
 
-Run `subagent list` at any time to rediscover active subagents and their handles, names, and current states if you no longer remember them.
+`wait` blocks until the subagent is idle and prints its final response. Set the bash timeout above `wait`'s 1800-second default. The output of `wait` is the result; the text in the subagent's tab is not a completion signal.
 
-`wait` follows the durable session state and prints the latest final assistant response. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline.
+Report the result to the user, attributed to the subagent's name. If it asks a question or needs a decision, relay it to the user and forward their answer with `subagent send`; the subagent decides with its own context.
 
-## Communicate
+## Follow up
 
 ```sh
-# Change the name shown in the parent UI.
+subagent send <handle> "message"              # idle: starts a new turn; busy: steers the current one
+subagent send <handle> --follow-up "message"  # busy: runs after the current turn
 subagent rename <handle> "new name"
-
-# Idle: starts a new prompt. Busy: steers the current work.
-subagent send <handle> "message"
-
-# Busy: waits until current work finishes, then starts another turn.
-subagent send <handle> --follow-up "message"
+subagent status <handle>
+subagent list                                 # rediscover handles, names, and states
 ```
 
-Names are 1–64 characters and need not be unique. Messages use the subagent extension's control inbox; do not type into the child's herdr pane.
+The subagent keeps its full context between turns; after `send`, run `wait` again for its reply. Messages go through `send`, which reaches the subagent's control inbox.
 
-## Stop
+## Lifetime
 
-```sh
-subagent stop <handle>
-```
-
-Never stop a subagent on your own initiative, even after its work is done: the user keeps subagents around and closes them. Run `stop` only when the user explicitly asks. It closes the child's herdr pane and removes the run transcript and metadata.
-
-The interactive `/subagent` command lists active subagents spawned by the current Pi session. Selecting one focuses its herdr tab; switch tabs to return to the parent.
+Subagents keep running until the user closes their tab: finishing a turn, `/reload`, and quitting this session all leave them alive. Leave finished subagents running for the user to close. Run `subagent stop <handle>` only when the user asks; it closes the tab and deletes the subagent's transcript.

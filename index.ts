@@ -3,19 +3,24 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DynamicBorder, type ExtensionAPI, type ExtensionContext, keyHint } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
+import { createResultPusher, registerResultRenderer, undeliveredResponse } from "./delivery.ts";
 import {
+	DELIVERY_MODES,
 	effectiveRunState,
 	findRunPane,
 	focusRunTab,
 	inboxDir,
 	insideHerdr,
+	isDelivery,
 	listRuns,
+	readDefaultDelivery,
 	readMetadata,
 	removeRunDir,
 	runDisplayName,
 	type InboxMessage,
 	type RunMetadata,
 	updateMetadata,
+	writeDefaultDelivery,
 } from "./shared.ts";
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
@@ -33,7 +38,8 @@ function displayState(metadata: RunMetadata): string {
 export default function subagentExtension(pi: ExtensionAPI) {
 	const runDir = process.env.PI_SUBAGENT_RUN_DIR;
 	if (!runDir) {
-		pi.on("resources_discover", () => ({ skillPaths: [join(packageDir, "skills")] }));
+		// Only the skill for the current default delivery is visible, so the parent learns one workflow.
+		pi.on("resources_discover", () => ({ skillPaths: [join(packageDir, "skills", readDefaultDelivery())] }));
 	}
 
 	pi.registerCommand("subagent", {
@@ -101,6 +107,35 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	});
 
 	if (!runDir) {
+		registerResultRenderer(pi);
+		const pushResults = createResultPusher(pi);
+
+		pi.registerCommand("subagent-mode", {
+			description: "Show or set how new subagents report back: wait (default) or push",
+			getArgumentCompletions: (prefix) =>
+				DELIVERY_MODES.filter((mode) => mode.startsWith(prefix.trim())).map((mode) => ({ value: mode, label: mode })),
+			handler: async (args, ctx) => {
+				const requested = args.trim();
+				const current = readDefaultDelivery();
+				if (!requested) {
+					ctx.ui.notify(`Subagent delivery: ${current}. Change it with /subagent-mode wait|push`, "info");
+					return;
+				}
+				if (!isDelivery(requested)) {
+					ctx.ui.notify(`Unknown delivery mode: ${requested}. Use wait or push`, "error");
+					return;
+				}
+				if (requested === current) {
+					ctx.ui.notify(`Subagent delivery is already ${current}`, "info");
+					return;
+				}
+				writeDefaultDelivery(requested);
+				ctx.ui.notify(`Subagent delivery set to ${requested} for new subagents; reloading`, "info");
+				// Reload swaps in the matching skill. Code after this belongs to the old runtime.
+				await ctx.reload();
+			},
+		});
+
 		let widgetTimer: ReturnType<typeof setInterval> | undefined;
 		let widgetContext: ExtensionContext | undefined;
 
@@ -136,6 +171,8 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			for (const run of listRuns(parentSessionId)) {
 				// No terminal yet means the run is still being spawned.
 				if (!run.herdrTerminalId) continue;
+				// Keep a closed push run until its last response has reached this session.
+				if (run.delivery === "push" && undeliveredResponse(run)) continue;
 				try {
 					if (findRunPane(run)) continue;
 				} catch {
@@ -151,7 +188,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (!ctx.hasUI) return;
 			widgetContext = ctx;
 			refreshWidget();
-			widgetTimer = setInterval(refreshWidget, 1000);
+			// The first push waits for the interval so no turn starts while the session is still starting.
+			widgetTimer = setInterval(() => {
+				refreshWidget();
+				pushResults(ctx);
+			}, 1000);
 			widgetTimer.unref();
 		});
 

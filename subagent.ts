@@ -1,19 +1,25 @@
 #!/usr/bin/env node
 
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	assistantText,
 	closeRunPane,
+	type Delivery,
 	effectiveRunState,
 	findRunPane,
 	getRunsDir,
+	hasPendingInbox,
 	inboxDir,
 	insideHerdr,
+	isDelivery,
+	isFailedResponse,
 	launchRun,
 	listRuns,
+	markDelivered,
+	readDefaultDelivery,
 	readLatestAssistant,
 	readMetadata,
 	removeRunDir,
@@ -39,7 +45,7 @@ function fail(message: string): never {
 function usage(): never {
 	fail(`Usage:
   subagent spawn [--name <name>] [--provider <provider>] [--model <model>] [--thinking <level>]
-    [--cwd <dir>] [--tools <names>] [--no-extensions] [--no-skills]
+    [--cwd <dir>] [--delivery wait|push] [--tools <names>] [--no-extensions] [--no-skills]
     [--no-prompt-templates] [--no-context-files] (--prompt <text> | --file <path>)...
   subagent status <handle>
   subagent rename <handle> <name>
@@ -89,6 +95,7 @@ function spawnSubagent(args: string[]): void {
 	let model = process.env.PI_MODEL;
 	let thinking = process.env.PI_REASONING_LEVEL || "medium";
 	let cwd = process.cwd();
+	let delivery: Delivery = readDefaultDelivery();
 	let tools: string | undefined;
 	let noExtensions = false;
 	let noSkills = false;
@@ -120,6 +127,13 @@ function spawnSubagent(args: string[]): void {
 				cwd = resolve(valueAfter(args, i, arg));
 				i++;
 				break;
+			case "--delivery": {
+				const value = valueAfter(args, i, arg);
+				if (!isDelivery(value)) fail(`--delivery must be wait or push, got: ${value}`);
+				delivery = value;
+				i++;
+				break;
+			}
 			case "--tools":
 				tools = valueAfter(args, i, arg);
 				i++;
@@ -166,7 +180,6 @@ function spawnSubagent(args: string[]): void {
 	mkdirSync(inboxDir(runDir), { recursive: true, mode: 0o700 });
 	writeFileSync(sessionFile, "", { mode: 0o600 });
 
-
 	const now = new Date().toISOString();
 	const metadata: RunMetadata = {
 		version: 2,
@@ -180,6 +193,7 @@ function spawnSubagent(args: string[]): void {
 		provider,
 		model,
 		thinking,
+		delivery,
 		state: "starting",
 		hasStarted: false,
 		createdAt: now,
@@ -202,14 +216,22 @@ function spawnSubagent(args: string[]): void {
 		throw error;
 	}
 
-	process.stdout.write(`Spawned ${runDisplayName(metadata)}\nState: busy\nHerdr tab: ${runTabLabel(metadata)}\n`);
+	process.stdout.write(
+		`Spawned ${runDisplayName(metadata)}\nState: busy\nHerdr tab: ${runTabLabel(metadata)}\n${deliveryNote(delivery)}`,
+	);
+}
+
+function deliveryNote(delivery: Delivery | undefined): string {
+	return delivery === "push"
+		? "Delivery: push. The reply arrives in this conversation automatically; do not run `subagent wait`.\n"
+		: "";
 }
 
 function statusSubagent(args: string[]): void {
 	if (args.length !== 1) usage();
 	const metadata = getRun(args[0]);
 	process.stdout.write(
-		`${runDisplayName(metadata)}: ${effectiveRunState(metadata)} (${metadata.provider}/${metadata.model}, ${metadata.thinking})\nHerdr tab: ${runTabLabel(metadata)}\n`,
+		`${runDisplayName(metadata)}: ${effectiveRunState(metadata)} (${metadata.provider}/${metadata.model}, ${metadata.thinking}, ${metadata.delivery ?? "wait"} delivery)\nHerdr tab: ${runTabLabel(metadata)}\n`,
 	);
 }
 
@@ -249,7 +271,7 @@ function sendSubagent(args: string[]): void {
 
 	const state = effectiveRunState(metadata);
 	const verb = followUp && state === "busy" ? "Queued follow-up for" : state === "idle" ? "Prompted" : "Steered";
-	process.stdout.write(`${verb} ${runDisplayName(metadata)}\n`);
+	process.stdout.write(`${verb} ${runDisplayName(metadata)}\n${deliveryNote(metadata.delivery)}`);
 }
 
 function parseTimeout(args: string[]): number {
@@ -268,17 +290,17 @@ async function waitSubagent(args: string[]): Promise<void> {
 
 	while (Date.now() < deadline) {
 		const metadata = getRun(handle);
-		const pending = existsSync(inboxDir(metadata.runDir))
-			? readdirSync(inboxDir(metadata.runDir)).some((file) => file.endsWith(".json"))
-			: false;
+		const pending = hasPendingInbox(metadata.runDir);
 		const state = effectiveRunState(metadata);
 		if (state === "error") fail(metadata.error || `${handle} failed`);
 		if (state === "exited") fail(`${handle} exited before finishing`);
 		if (metadata.hasStarted && state === "idle" && !pending) {
-			const message = readLatestAssistant(metadata.sessionFile);
-			if (!message) fail(`${handle} finished without an assistant response`);
-			process.stdout.write(`${handle} finished\n\n${assistantText(message)}\n`);
-			if (message.stopReason === "error" || message.stopReason === "aborted") process.exitCode = 1;
+			const latest = readLatestAssistant(metadata.sessionFile);
+			if (!latest) fail(`${handle} finished without an assistant response`);
+			// A push run must not deliver this response to the parent a second time.
+			markDelivered(metadata.runDir, latest.entryId);
+			process.stdout.write(`${handle} finished\n\n${assistantText(latest.message)}\n`);
+			if (isFailedResponse(latest.message)) process.exitCode = 1;
 			return;
 		}
 		await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
@@ -307,7 +329,7 @@ function listSubagents(args: string[]): void {
 	}
 	for (const metadata of runs) {
 		process.stdout.write(
-			`${runDisplayName(metadata)}  ${effectiveRunState(metadata).padEnd(8)}  ${metadata.provider}/${metadata.model}  ${metadata.thinking}\n`,
+			`${runDisplayName(metadata)}  ${effectiveRunState(metadata).padEnd(8)}  ${metadata.provider}/${metadata.model}  ${metadata.thinking}  ${metadata.delivery ?? "wait"}\n`,
 		);
 	}
 }

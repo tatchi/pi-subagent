@@ -73,6 +73,15 @@ subagent list
 
 Use `/subagent` to select an active child and focus its herdr tab. Spawning never takes focus. The status widget shows active names (or handles for unnamed runs) and their current state.
 
+## Delivery modes
+
+A run's delivery mode decides how its results reach the parent:
+
+- `wait` (default): the parent runs `subagent wait <handle>`, which blocks until the child is idle and prints its final response.
+- `push`: the parent never waits. Each time the child finishes a turn, the parent's extension adds its final response to the parent conversation as a labeled message, collapsed to a few lines. If the parent is busy, the result arrives after its current turn; if it is idle, the result starts a turn. A response is never delivered twice, including one already returned by `wait`.
+
+Set the default for new runs with `/subagent-mode wait|push` (or `/subagent-mode` to show it). It is stored in `subagent.json` in the Pi agent directory and reloads the session, so the parent sees the skill for that mode: `skills/wait` or `skills/push`. Other open sessions pick up the new skill after `/reload`. Override a single run with `subagent spawn --delivery wait|push`. Existing runs keep the mode they were spawned with.
+
 ## Isolation
 
 Optional spawn flags:

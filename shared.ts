@@ -15,6 +15,17 @@ import { dirname, join } from "node:path";
 
 export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
 
+/**
+ * How a run's results reach the parent. `wait`: only through `subagent wait`. `push`: the parent's
+ * extension also injects each new final response into the parent conversation.
+ */
+export type Delivery = "wait" | "push";
+export const DELIVERY_MODES: readonly Delivery[] = ["wait", "push"];
+
+export function isDelivery(value: unknown): value is Delivery {
+	return value === "wait" || value === "push";
+}
+
 export interface RunMetadata {
 	version: 2;
 	handle: string;
@@ -33,6 +44,8 @@ export interface RunMetadata {
 	provider: string;
 	model: string;
 	thinking: string;
+	/** Fixed at spawn; absent means `wait`. */
+	delivery?: Delivery;
 	state: RunState;
 	hasStarted: boolean;
 	createdAt: string;
@@ -80,6 +93,67 @@ export function inboxDir(runDir: string): string {
 	return join(runDir, "inbox");
 }
 
+export function hasPendingInbox(runDir: string): boolean {
+	try {
+		return readdirSync(inboxDir(runDir)).some((file) => file.endsWith(".json"));
+	} catch {
+		return false;
+	}
+}
+
+function configPath(): string {
+	return join(getAgentDir(), "subagent.json");
+}
+
+/** Default delivery for new runs, from `subagent.json` in the agent directory. */
+export function readDefaultDelivery(): Delivery {
+	try {
+		const value: unknown = JSON.parse(readFileSync(configPath(), "utf8"));
+		const delivery = (value as Record<string, unknown> | null)?.delivery;
+		return isDelivery(delivery) ? delivery : "wait";
+	} catch {
+		return "wait";
+	}
+}
+
+export function writeDefaultDelivery(delivery: Delivery): void {
+	let config: Record<string, unknown> = {};
+	try {
+		const value: unknown = JSON.parse(readFileSync(configPath(), "utf8"));
+		if (typeof value === "object" && value !== null && !Array.isArray(value)) config = value as Record<string, unknown>;
+	} catch {
+		// Missing or malformed: start from an empty config.
+	}
+	writeFileAtomic(configPath(), `${JSON.stringify({ ...config, delivery }, null, 2)}\n`);
+}
+
+/**
+ * Session entry ID of the last final response handed to the parent, by `wait` or by push. Kept in
+ * its own file, written only by the parent side, so it never races the child's metadata updates.
+ */
+function deliveredPath(runDir: string): string {
+	return join(runDir, "delivered");
+}
+
+export function readDeliveredEntryId(runDir: string): string | undefined {
+	try {
+		return readFileSync(deliveredPath(runDir), "utf8").trim() || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export function markDelivered(runDir: string, entryId: string): void {
+	writeFileAtomic(deliveredPath(runDir), `${entryId}\n`);
+}
+
+function writeFileAtomic(target: string, content: string): void {
+	mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+	const temporary = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+	writeFileSync(temporary, content, { encoding: "utf8", mode: 0o600 });
+	renameSync(temporary, target);
+}
+
 export function isValidRunName(value: unknown): value is string {
 	return (
 		typeof value === "string" &&
@@ -90,7 +164,7 @@ export function isValidRunName(value: unknown): value is string {
 	);
 }
 
-export function runDisplayName(metadata: RunMetadata): string {
+export function runDisplayName(metadata: Pick<RunMetadata, "handle" | "name">): string {
 	return metadata.name ? `${metadata.name} (${metadata.handle})` : metadata.handle;
 }
 
@@ -104,6 +178,7 @@ export function readMetadata(runDir: string): RunMetadata | undefined {
 			typeof metadata.handle !== "string" ||
 			(metadata.name !== undefined && !isValidRunName(metadata.name)) ||
 			(metadata.herdrTerminalId !== undefined && typeof metadata.herdrTerminalId !== "string") ||
+			(metadata.delivery !== undefined && !isDelivery(metadata.delivery)) ||
 			typeof metadata.sessionFile !== "string" ||
 			typeof metadata.runDir !== "string"
 		) {
@@ -116,11 +191,7 @@ export function readMetadata(runDir: string): RunMetadata | undefined {
 }
 
 export function writeMetadata(metadata: RunMetadata): void {
-	mkdirSync(dirname(metadataPath(metadata.runDir)), { recursive: true, mode: 0o700 });
-	const target = metadataPath(metadata.runDir);
-	const temporary = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-	writeFileSync(temporary, `${JSON.stringify(metadata, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-	renameSync(temporary, target);
+	writeFileAtomic(metadataPath(metadata.runDir), `${JSON.stringify(metadata, null, 2)}\n`);
 }
 
 export function updateMetadata(runDir: string, patch: Partial<RunMetadata>): RunMetadata | undefined {
@@ -338,7 +409,31 @@ function isAssistantEntry(entry: SessionEntry): entry is AssistantEntry {
 	return (entry.message as Record<string, unknown>).role === "assistant";
 }
 
-export function readLatestAssistant(sessionFile: string): AssistantMessage | undefined {
+export interface LatestAssistant {
+	entryId: string;
+	message: AssistantMessage;
+	/** Text of the last user message before the response, whoever sent it (parent or user in the tab). */
+	prompt?: string;
+}
+
+function isUserEntry(entry: SessionEntry): entry is SessionEntry & { message: { content?: unknown } } {
+	if (entry.type !== "message" || typeof entry.message !== "object" || entry.message === null) return false;
+	return (entry.message as Record<string, unknown>).role === "user";
+}
+
+function contentText(content: unknown): string {
+	if (typeof content === "string") return content.trim();
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
+	for (const item of content) {
+		if (typeof item !== "object" || item === null) continue;
+		const block = item as Record<string, unknown>;
+		if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
+	}
+	return parts.join("\n").trim();
+}
+
+export function readLatestAssistant(sessionFile: string): LatestAssistant | undefined {
 	let content: string;
 	try {
 		content = readFileSync(sessionFile, "utf8");
@@ -355,16 +450,18 @@ export function readLatestAssistant(sessionFile: string): AssistantMessage | und
 			// The final JSONL record may still be in the process of being appended.
 		}
 	}
-	return activeBranch(entries).findLast(isAssistantEntry)?.message;
+	const branch = activeBranch(entries);
+	const index = branch.findLastIndex(isAssistantEntry);
+	if (index < 0) return undefined;
+	const entry = branch[index] as AssistantEntry;
+	const user = branch.slice(0, index).findLast(isUserEntry);
+	return { entryId: entry.id, message: entry.message, prompt: user && contentText(user.message.content) };
+}
+
+export function isFailedResponse(message: AssistantMessage): boolean {
+	return message.stopReason === "error" || message.stopReason === "aborted";
 }
 
 export function assistantText(message: AssistantMessage): string {
-	if (!Array.isArray(message.content)) return message.errorMessage ?? "(no response text)";
-	const parts: string[] = [];
-	for (const item of message.content) {
-		if (typeof item !== "object" || item === null) continue;
-		const block = item as Record<string, unknown>;
-		if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
-	}
-	return parts.join("\n").trim() || message.errorMessage || "(no response text)";
+	return contentText(message.content) || message.errorMessage || "(no response text)";
 }
